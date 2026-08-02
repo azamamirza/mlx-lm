@@ -9,7 +9,12 @@ from mlx.utils import tree_flatten, tree_map
 
 from mlx_lm.models import rope_utils
 from mlx_lm.models.base import create_causal_mask, scaled_dot_product_attention
-from mlx_lm.models.cache import KVCache, RotatingKVCache, make_prompt_cache
+from mlx_lm.models.cache import (
+    ChunkedKVCache,
+    KVCache,
+    RotatingKVCache,
+    make_prompt_cache,
+)
 from mlx_lm.models.gated_delta import (
     gated_delta_kernel,
     gated_delta_ops,
@@ -136,6 +141,40 @@ class TestModels(unittest.TestCase):
         k, v = cache.update_and_fetch(x, x)
         self.assertEqual(cache.offset, 22)
         self.assertTrue(mx.allclose(x, k[..., -2:, :]))
+
+    def test_chunked_kv_cache_maybe_trim_front(self):
+        b, h, d = 1, 2, 32
+        cache = ChunkedKVCache(chunk_size=4)
+
+        k = mx.random.uniform(shape=(b, h, 6, d))
+        v = mx.random.uniform(shape=(b, h, 6, d))
+        cache.update_and_fetch(k, v)
+
+        # The buffer is padded to a multiple of the allocation step so only
+        # offset - start_position entries are valid.
+        cache.maybe_trim_front()
+        self.assertEqual(cache.start_position, 2)
+
+        k2 = mx.random.uniform(shape=(b, h, 1, d))
+        v2 = mx.random.uniform(shape=(b, h, 1, d))
+        k_up, v_up = cache.update_and_fetch(k2, v2)
+        self.assertEqual(cache.offset, 7)
+        self.assertTrue(
+            mx.array_equal(k_up, mx.concatenate([k[..., 2:, :], k2], axis=2))
+        )
+        self.assertTrue(
+            mx.array_equal(v_up, mx.concatenate([v[..., 2:, :], v2], axis=2))
+        )
+
+        # Trimming with at most chunk_size valid entries is a no-op
+        cache = ChunkedKVCache(chunk_size=8)
+        cache.update_and_fetch(k, v)
+        cache.maybe_trim_front()
+        self.assertEqual(cache.start_position, 0)
+
+        k_up, v_up = cache.update_and_fetch(k2, v2)
+        self.assertTrue(mx.array_equal(k_up, mx.concatenate([k, k2], axis=2)))
+        self.assertTrue(mx.array_equal(v_up, mx.concatenate([v, v2], axis=2)))
 
     def test_causal_mask_padding(self):
         right_padding = mx.array([2, 1, 0])
